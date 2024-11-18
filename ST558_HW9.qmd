@@ -1,0 +1,134 @@
+---
+title: "ST 558 Homework 8"
+author: "Lee Bennett"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+
+library(readr)
+library(tidyverse)
+library(purrr)
+library(tidymodels)
+```
+
+## Introduction
+
+## Importing the Data
+
+The first step is to read in the data via its URL. Using the option `locale` option eliminates the `invalid multibyte string, element 1` error:
+
+```{r}
+bikeData <- read_csv(file="https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",locale=locale(encoding="latin1"))
+```
+
+## Exploratory Data Analysis
+
+As the first step of the data exploration, we'll check for missing values and compute some summaries for both the numeric and categorical variables in the dataset:
+
+```{r missing data check and summary stats}
+#Check for NA values
+colSums(is.na(bikeData))
+
+#Compute summary stats for all numeric variables, rounding to 2 decimal places
+pivot_longer(bikeData |> summarize(across(where(is.numeric),list("mean"=mean,"sd"=sd),.names="{.fn}_{.col}")),everything()) |> mutate (across(where(is.numeric), ~num(.x,digits=2)))
+
+#Summarize levels for categorical variables
+levels(as_factor(bikeData$Holiday))
+levels(as_factor(bikeData$`Functioning Day`))
+levels(as_factor(bikeData$Seasons))
+```
+
+There is no missing data to consider. The summary statistics for the bike counts and the weather variables appear to be reasonable, and the levels of the categorical variables are what we would expect.
+
+The `Date` variable is a character vector in "dd/mm//yyyy" format, we'll use `lubridate` to convert it to a proper date format. We also convert the categorical (character) variables into factors and rename the variables to a standard format for further analyses:
+
+```{r}
+#| warning: false
+
+bikeData_rev <- bikeData |> mutate(Date=dmy(Date),
+                               Seasons=as.factor(Seasons),
+                               Holiday=as.factor(Holiday),
+                               `Functioning Day`=as.factor(`Functioning Day`))
+
+#Create a vector of new column names to apply to the tibble
+
+new_names <- c("date","rented_bike_count","hour","temperature","humidity","wind_speed","visibility",
+               "dew_point","solar_radiation","rainfall","snowfall","seasons","holiday",
+               "functioning_day")
+
+names(bikeData_rev) <- new_names
+
+```
+
+Next, let's look at a summary of bike rental days across the categorical variables for season, holiday, and functioning day:
+
+```{r}
+bikeData_rev |> group_by(seasons) |> summarize(n=sum(rented_bike_count))
+bikeData_rev |> group_by(holiday) |> summarize(n=sum(rented_bike_count))
+bikeData_rev |> group_by(functioning_day) |> summarize(n=sum(rented_bike_count))
+```
+
+We see that no bikes are rented on non-functioning days, so we can subset the data to include only functioning days.
+
+To create the dataset for modeling, we'll summarize the hourly data for the number of bikes rented, rainfall, and snowfall to create one observation per day:
+
+```{r}
+bike_daily <- bikeData_rev |> group_by(date,seasons,holiday) |> summarize("rainfall"=sum(rainfall),"snowfall"=sum(snowfall),"bikes_rented"=sum(rented_bike_count),                                                                 "mean_temp"=mean(temperature),"mean_humidity"=mean(humidity),"mean_visibility"=mean(visibility), "mean_solar_radiation"=mean(solar_radiation),
+                                                                "mean_wind"=mean(wind_speed), "mean_dew_point"=mean(dew_point)) |> select(date,seasons,holiday,rainfall,snowfall,bikes_rented,starts_with("mean"))
+
+
+```
+
+## Partitioning the Data
+
+We'll now partition the data, stratifying by season, into a training set (75%) and a test set (25%). We then create a 10-fold split on the training set:
+
+```{r}
+
+#Create initial split
+set.seed(1434)
+bike_split <- initial_split(bike_daily, prop=0.75, strata=seasons)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+
+#Create 10-fold cross-validation sets on the training data
+bike_10_fold <- vfold_cv(bike_train,10)
+```
+
+## Model Training
+
+```{r recipe 1 - base model}
+recipe1 <- recipe(bikes_rented ~ ., data = bike_train) |>
+  step_date(date,features="dow") |>
+  step_mutate(day_type=factor(if_else(date_dow %in% c("Sat","Sun"),"Weekend","Weekday"))) |>
+  step_rm(date,date_dow) |>
+  step_dummy(seasons,holiday,day_type) |>
+  step_normalize(all_numeric(), -all_outcomes())
+```
+
+```{r recipe 2 - interactions}
+recipe2 <- recipe(bikes_rented ~ ., data = bike_train) |>
+  step_date(date,features="dow") |>
+  step_mutate(day_type=factor(if_else(date_dow %in% c("Sat","Sun"),"Weekend","Weekday"))) |>
+  step_rm(date,date_dow) |>
+  step_dummy(seasons,holiday,day_type) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_interact(terms = ~ starts_with("seasons"):holiday_No.Holiday + starts_with("seasons"):mean_temp + rainfall:mean_temp)
+```
+
+```{r recipe 3 - quadratic terms}
+recipe3 <- recipe(bikes_rented ~ ., data = bike_train) |>
+  step_date(date,features="dow") |>
+  step_mutate(day_type=factor(if_else(date_dow %in% c("Sat","Sun"),"Weekend","Weekday"))) |>
+  step_rm(date,date_dow) |>
+  step_dummy(seasons,holiday,day_type) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_interact(terms = ~ starts_with("seasons"):holiday_No.Holiday + starts_with("seasons"):mean_temp + rainfall:mean_temp) |>
+  step_poly(rainfall, snowfall, mean_temp, mean_humidity, mean_visibility, mean_solar_radiation, mean_wind, mean_dew_point,
+degree = 2)
+```
+
+## Final Predictive Model
