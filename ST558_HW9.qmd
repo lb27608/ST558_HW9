@@ -1,5 +1,5 @@
 ---
-title: "ST 558 Homework 8"
+title: "ST 558 Homework 9"
 author: "Lee Bennett"
 format: html
 editor: visual
@@ -71,20 +71,33 @@ bikeData_rev |> group_by(holiday) |> summarize(n=sum(rented_bike_count))
 bikeData_rev |> group_by(functioning_day) |> summarize(n=sum(rented_bike_count))
 ```
 
-We see that no bikes are rented on non-functioning days, so we can subset the data to include only functioning days.
-
-To create the dataset for modeling, we'll summarize the hourly data for the number of bikes rented, rainfall, and snowfall to create one observation per day:
+We see that no bikes are rented on non-functioning days, so we can subset the data to include only functioning days. To create the dataset for modeling, we'll summarize the hourly data for the number of bikes rented, rainfall, and snowfall to create one observation per day:
 
 ```{r}
-bike_daily <- bikeData_rev |> group_by(date,seasons,holiday) |> summarize("rainfall"=sum(rainfall),"snowfall"=sum(snowfall),"bikes_rented"=sum(rented_bike_count),                                                                 "mean_temp"=mean(temperature),"mean_humidity"=mean(humidity),"mean_visibility"=mean(visibility), "mean_solar_radiation"=mean(solar_radiation),
-                                                                "mean_wind"=mean(wind_speed), "mean_dew_point"=mean(dew_point)) |> select(date,seasons,holiday,rainfall,snowfall,bikes_rented,starts_with("mean"))
+bike_daily <- bikeData_rev |> filter(functioning_day == "Yes") |> group_by(date,seasons,holiday) |> summarize("rainfall"=sum(rainfall),"snowfall"=sum(snowfall),"bikes_rented"=sum(rented_bike_count),                           "mean_temp"=mean(temperature),"mean_humidity"=mean(humidity),"mean_visibility"=mean(visibility), "mean_solar_radiation"=mean(solar_radiation),
+              "mean_wind"=mean(wind_speed), "mean_dew_point"=mean(dew_point)) |> select(date,seasons,holiday,rainfall,snowfall,bikes_rented,starts_with("mean"))
 
 
 ```
 
+Let's explore the summarized data by first looking at the same summary statistics for the number of bikes rented and then creating some scatterplots to see how the number of rentals varies by rainfall and mean temperature:
+
+```{r}
+#Summarize by seasons and holiday
+bike_daily |> group_by(seasons) |> summarize(n=sum(bikes_rented))
+bike_daily |> group_by(holiday) |> summarize(n=sum(bikes_rented))
+
+rain_plot <- ggplot(bike_daily, aes(x = rainfall, y = bikes_rented)) + geom_point(position="jitter") + labs(x="Mean rainfall", y="Number of bikes rented", title="Bike Rentals vs. Rainfall") + theme(plot.title = element_text(hjust = 0.5))
+rain_plot
+
+temp_plot <- ggplot(bike_daily, aes(x = mean_temp, y = bikes_rented)) + geom_point(position="jitter") + labs(x="Mean temperature", y="Number of bikes rented", title="Bike Rentals vs. Mean Temperature") + theme(plot.title = element_text(hjust = 0.5))
+temp_plot
+```
+The plot of bike rentals vs. mean rainfall is heavily skewed, with most of the observations clustered at 0 (no rainfall). The scatterplot for mean temperature suggests a nonlinear relationship with the number of bikes rented; that value peaks around 22 degrees and then tends to decrease. This association suggests that a higher-order term (e.g., quadratic) may be needed in a model to predict bike rentals using temperature.
+
 ## Partitioning the Data
 
-We'll now partition the data, stratifying by season, into a training set (75%) and a test set (25%). We then create a 10-fold split on the training set:
+We'll now partition the data, stratifying by season, into a training set (75%) and a test set (25%) and then create a 10-fold cross-validation set using the training data. 
 
 ```{r}
 
@@ -100,6 +113,7 @@ bike_10_fold <- vfold_cv(bike_train,10)
 
 ## Model Training
 
+We'll consider three models for predicting the total number of bike rentals per day. The first will have only main effects for type of day (weekday or weekend), seasons, and holiday along with predictors for the average weather variables for each day:
 ```{r recipe 1 - base model}
 recipe1 <- recipe(bikes_rented ~ ., data = bike_train) |>
   step_date(date,features="dow") |>
@@ -107,7 +121,11 @@ recipe1 <- recipe(bikes_rented ~ ., data = bike_train) |>
   step_rm(date,date_dow) |>
   step_dummy(seasons,holiday,day_type) |>
   step_normalize(all_numeric(), -all_outcomes())
+
+prep(recipe1)
 ```
+
+The second model extends the first model by adding interaction terms for season with holiday status and mean temperature along with an interaction between rainfall and mean temperature:
 
 ```{r recipe 2 - interactions}
 recipe2 <- recipe(bikes_rented ~ ., data = bike_train) |>
@@ -117,7 +135,11 @@ recipe2 <- recipe(bikes_rented ~ ., data = bike_train) |>
   step_dummy(seasons,holiday,day_type) |>
   step_normalize(all_numeric(), -all_outcomes()) |>
   step_interact(terms = ~ starts_with("seasons"):holiday_No.Holiday + starts_with("seasons"):mean_temp + rainfall:mean_temp)
+
+prep(recipe2)
 ```
+
+The last model adds to the second model by including quadratic terms for all of the continuous weather-related variables using orthogonal polynomials using `step_poly`:
 
 ```{r recipe 3 - quadratic terms}
 recipe3 <- recipe(bikes_rented ~ ., data = bike_train) |>
@@ -129,6 +151,43 @@ recipe3 <- recipe(bikes_rented ~ ., data = bike_train) |>
   step_interact(terms = ~ starts_with("seasons"):holiday_No.Holiday + starts_with("seasons"):mean_temp + rainfall:mean_temp) |>
   step_poly(rainfall, snowfall, mean_temp, mean_humidity, mean_visibility, mean_solar_radiation, mean_wind, mean_dew_point,
 degree = 2)
+
+prep(recipe3)
+```
+
+With these model recipes complete, we can train each model using the 10-fold CV training set. We'll then compare the model fits using the RMSE and R-squared metrics:
+
+```{r train models}
+#Set model and model engine
+bike_model <- linear_reg() |> set_engine("lm")
+
+#Create workflows
+bike_wf1 <- workflow() |> add_recipe(recipe1) |> add_model(bike_model)
+bike_wf1
+
+bike_wf2 <- workflow() |> add_recipe(recipe2) |> add_model(bike_model)
+bike_wf2
+
+bike_wf3 <- workflow() |> add_recipe(recipe3) |> add_model(bike_model)
+bike_wf3
+
+#Fit the models and summarize model fit metrics
+bike_fit1 <- bike_wf1 |> fit_resamples(bike_10_fold)
+bike_fit2 <- bike_wf2 |> fit_resamples(bike_10_fold)
+bike_fit3 <- bike_wf3 |> fit_resamples(bike_10_fold)
+
+fit_metrics <- rbind(bike_fit1 |> collect_metrics(),bike_fit2 |> collect_metrics(),bike_fit3 |> collect_metrics())
+fit_metrics
+
 ```
 
 ## Final Predictive Model
+
+Based on the fit metrics, the third model has the smallest RMSE and the largest R-squared, so it appears to be the best fit for the data among the 3 models that were tested. We can now fit this model to the entire training data set created with `initial_split` and obtain the final fit metrics:
+
+```{r}
+final_fit <- bike_wf3 |> last_fit(bike_split)
+final_metrics <- final_fit |> collect_metrics()
+final_metrics
+```
+
