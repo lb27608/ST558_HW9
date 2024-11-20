@@ -1,5 +1,5 @@
 ---
-title: "ST 558 Homework 9"
+title: "ST 558 Homework 8/9"
 author: "Lee Bennett"
 format: html
 editor: visual
@@ -191,3 +191,23 @@ final_metrics <- final_fit |> collect_metrics()
 final_metrics
 ```
 
+## Homework 9: Additional Models
+
+Next, we'll add to the linear regression models by fitting LASSO models, regression tree models, bagged tree models, and random forest models. Like the linear regression models, the best model in each class will be selected using the 10-fold CV training set. The selected model will then be fit using the full training set and then tested on the test split.
+
+### LASSO model
+
+```{r LASSO model}
+LASSO_spec <- linear_reg(penalty = tune(), mixture = 1) |> set_engine("glmnet")
+
+#Use the same recipe as the third linear regression model above
+LASSO_recipe <- recipe3
+
+#Create the workflow
+LASSO_wkf <- workflow() |> add_recipe(LASSO_recipe) |> add_model(LASSO_spec)
+LASSO_wkf
+
+#Specify the grid for the tuning parameter
+LASSO_grid <- LASSO_wkf |> tune_grid(resamples = bike_10_fold,
+              grid = grid_regular(penalty(), levels = 200)) 
+```
