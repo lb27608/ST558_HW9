@@ -12,6 +12,11 @@ library(readr)
 library(tidyverse)
 library(purrr)
 library(tidymodels)
+library(glmnet)
+library(tree)
+library(baguette)
+library(ranger)
+library(vip)
 ```
 
 ## Introduction
@@ -210,4 +215,180 @@ LASSO_wkf
 #Specify the grid for the tuning parameter
 LASSO_grid <- LASSO_wkf |> tune_grid(resamples = bike_10_fold,
               grid = grid_regular(penalty(), levels = 200)) 
+
+#Collect metrics and choose model with lowest RMSE
+LASSO_grid |> collect_metrics() |> filter(.metric == "rmse")
+
+lowest_rmse <- LASSO_grid |> select_best(metric = "rmse")
+
+#Finalize the workflow and fit the model on the full training set
+LASSO_final_wkf <- LASSO_wkf |> finalize_workflow(lowest_rmse)
 ```
+
+### Regression tree model
+
+Next, we'll fit a regression tree model using the `rpart` engine:
+
+```{r Regression tree model}
+tree_spec <- decision_tree(tree_depth = tune(),
+                          min_n = 20,
+                          cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+#Use the first regression model recipe since interactions aren't needed
+tree_recipe <- recipe1
+
+#Create the workflow
+tree_wkf <- workflow() |> add_recipe(tree_recipe) |> add_model(tree_spec)
+
+
+tree_grid <- tree_wkf |> tune_grid(resamples = bike_10_fold)
+
+#Collect metrics and choose model with lowest RMSE
+tree_grid |> collect_metrics() |> filter(.metric == "rmse")
+
+tree_best_params <- select_best(tree_grid, metric="rmse")
+tree_best_params
+
+#Finalize the workflow and run the final model on the full training set
+tree_final_wkf <- tree_wkf |> finalize_workflow(tree_best_params)
+
+```
+
+## Bagged Tree Model
+
+For the first ensemble model, we'll fit a bagged tree:
+
+```{r Bagged tree model}
+bag_spec <- bag_tree(tree_depth = 5, min_n = 10, cost_complexity = tune()) |>
+set_engine("rpart") |> set_mode("regression")
+
+#Use the first regression model recipe again
+bag_recipe <- recipe1
+
+#Create the workflow
+bag_wkf <- workflow() |> add_recipe(bag_recipe) |> add_model(bag_spec)
+
+bag_fit <- bag_wkf |> tune_grid(resamples = bike_10_fold,
+                                grid = grid_regular(cost_complexity(),
+                                                    levels = 15))
+
+bag_fit |> collect_metrics() |> filter(.metric == "rmse")
+
+bag_best_params <- select_best(bag_fit, metric="rmse")
+bag_best_params
+
+#Finalize the workflow and run the final model on the full training set
+bag_final_wkf <- bag_wkf |> finalize_workflow(bag_best_params)
+
+```
+
+## Random forest model
+
+Finally, our second ensemble model will be a random forest:
+
+```{r Random forest model}
+rf_spec <- rand_forest(mtry = tune()) |> set_engine("ranger",importance="impurity") |>
+  set_mode("regression")
+
+#Use the first regression model recipe again
+rf_recipe <- recipe1
+
+#Create the workflow
+rf_wkf <- workflow() |> add_recipe(rf_recipe) |> add_model(rf_spec)
+
+rf_fit <- rf_wkf |> tune_grid(resamples = bike_10_fold,
+                              grid = 7)
+
+rf_fit |> collect_metrics() |> filter(.metric == "rmse")
+
+rf_best_params <- select_best(rf_fit, metric="rmse")
+
+#Finalize the workflow and run the final model on the full training set
+rf_final_wkf <- rf_wkf |> finalize_workflow(rf_best_params)
+```
+
+## Compare models on test set
+
+Let's compare all of the model predictions on the test set using RMSE and MAE as the metrics:
+
+```{r}
+#Get predictions from final models on test dataset
+MLR_final_pred <- bike_wf3 |> fit(bike_train) |> predict(bike_test) |> pull()
+LASSO_final_pred <- LASSO_final_wkf |> fit(bike_train) |> predict(bike_test) |> pull()
+tree_final_pred <- tree_final_wkf |> fit(bike_train) |> predict(bike_test) |> pull()
+bag_final_pred <- bag_final_wkf |> fit(bike_train) |> predict(bike_test) |> pull()
+rf_final_pred <- rf_final_wkf |> fit(bike_train) |> predict(bike_test) |> pull()
+
+true_rentals <- bike_test$bikes_rented
+
+#Compute RMSE and MAE for each model
+MLR_metrics <- c("rmse"=MLR_final_pred |> rmse_vec(truth = true_rentals),"mae"=MLR_final_pred |> mae_vec(truth = true_rentals))
+MLR_metrics
+
+LASSO_metrics <- c("rmse"=LASSO_final_pred |> rmse_vec(truth = true_rentals),"mae"=LASSO_final_pred |> mae_vec(truth = true_rentals))
+LASSO_metrics
+
+tree_metrics <- c("rmse"=tree_final_pred |> rmse_vec(truth = true_rentals),"mae"=tree_final_pred |> mae_vec(truth = true_rentals))
+tree_metrics
+
+bag_metrics <- c("rmse"=bag_final_pred |> rmse_vec(truth = true_rentals),"mae"=bag_final_pred |> mae_vec(truth = true_rentals))
+bag_metrics
+
+rf_metrics <- c("rmse"=rf_final_pred |> rmse_vec(truth = true_rentals),"mae"=rf_final_pred |> mae_vec(truth = true_rentals))
+rf_metrics
+```
+
+The random forest model has the smallest RMSE, but the multiple linear regression has the smallest MAE among these classes of models. Let's summarize the structure of each of these models, starting with model effects tables for the multiple linear regression and LASSO models:
+
+```{r}
+MLR_model <- bike_wf3 |> fit(bike_train)
+tidy(MLR_model)
+
+LASSO_model <- LASSO_final_wkf |> fit(bike_train) 
+tidy(LASSO_model)
+```
+For the regression tree model, we'll look at a tree plot:
+
+```{r}
+tree_final <- tree_final_wkf |> fit(bike_train) |> extract_fit_engine()
+plot(tree_final)
+text(tree_final,cex=0.6)
+```
+That's sort of ugly, but I can't figure out how to format the text labels properly!
+
+Finally, for the bagged tree model and random forest model, we'll look at variable importance plots:
+
+```{r}
+bag_final_model<- bag_final_wkf |> fit(bike_train) |> extract_fit_engine()
+bag_final_model$imp |>
+mutate(term = factor(term, levels = term)) |>
+ggplot(aes(x = term, y = value)) + labs(title="Variable Imporance for Bagged Model") +
+theme(plot.title = element_text(hjust = 0.5)) +
+geom_bar(stat ="identity") +
+coord_flip()
+
+rf_res <- last_fit(rf_final_wkf, split = bike_split)
+extract_fit_parsnip(rf_res$.workflow[[1]]) |> vip::vi() |> mutate(term=factor(Variable, levels=Variable)) |>
+ggplot(aes(x = term, y = Importance)) + labs(title="Variable Imporance for Random Forest Model") +
+theme(plot.title = element_text(hjust = 0.5)) +
+geom_bar(stat ="identity") +
+coord_flip()
+```
+
+For both of these ensemble models, we can see that the average daily temperature is the most important predictor, with solar radiation and dew point being second and third most important.
+
+If we use RMSE as the criterion for choosing the best model, then the random forest would be selected. We'll now fit that model on the full dataset:
+
+```{r Random forest full dataset}
+#Fit model to the full dataset and obtain predictions
+rf_full_pred<- rf_final_wkf |> fit(bike_daily) |> predict(bike_daily) |> pull()
+true_bikes <- bike_daily$bikes_rented
+
+#Get RMSE and MAE for predictions
+rf_metrics <- c("rmse"=rf_full_pred |> rmse_vec(truth = true_bikes),"mae"=rf_full_pred |> mae_vec(truth = true_bikes))
+rf_metrics
+
+```
+
